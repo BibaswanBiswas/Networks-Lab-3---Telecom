@@ -285,43 +285,52 @@
         // ── Marker detection ─────────────────────────────────────────────────────
 
         _findMarkers(W, H) {
-            // Detect MAGENTA (#FF00FF) finder markers using HSV hue-range isolation.
-            // Magenta in OpenCV HSV (0–180 scale): H ≈ 140–175, S ≥ 140, V ≥ 80.
-            // This completely avoids picking up dark background objects, shadows,
-            // clothing, or furniture — the previous source of false detections.
-            let src = null, rgb = null, hsv = null;
-            let maskLo = null, maskHi = null, mask = null, closed = null, kernel = null;
+            // Detect MAGENTA (#FF00FF) finder markers via per-channel RGB thresholding.
+            //
+            // Magenta criteria (RGB):
+            //   R > 120, G < 100, B > 120
+            //
+            // Why RGB-channel split instead of HSV inRange:
+            //   cv.inRange() in OpenCV.js requires bounds Mats the same size as the
+            //   source, not scalar-like 1×1 Mats — using 1×1 bounds silently fails.
+            //   Per-channel thresholding is guaranteed to work and is equally fast.
+            //
+            // Fallback: if the magenta mask returns <4 candidates (heavy camera
+            //   auto-white-balance shift), also try an adaptive-threshold on the
+            //   grayscale image (same approach that worked before, as a safety net).
+            let src = null, rgb = null, rgba = null;
+            let rCh = null, gCh = null, bCh = null, rgbaChans = null, rgbChans = null;
+            let maskR = null, maskG = null, maskB = null;
+            let mask = null, closed = null, kernel = null;
+            let gray = null, blur = null, binary = null;
             let contours = null, hierarchy = null;
             this._lastCandidateCount = 0;
 
             try {
                 const imgData = this._capCtx.getImageData(0, 0, W, H);
-                src = cv.matFromImageData(imgData);
+                src = cv.matFromImageData(imgData); // RGBA
 
+                // ── Pass 1: Magenta RGB channel split ─────────────────────────────
                 rgb = new cv.Mat();
                 cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
-                hsv = new cv.Mat();
-                cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
 
-                // Magenta hue wraps at 180/0 in OpenCV — it spans 140–175 when pure.
-                // Use two inRange passes to be safe (handles slight hue drift under
-                // different lighting / camera white balance).
-                //   Pass A: H 140–175, S ≥ 110, V ≥ 60  (primary magenta band)
-                //   Pass B: H 0–5, S ≥ 110, V ≥ 60       (red-side magenta edge)
-                const loA  = cv.matFromArray(1, 1, cv.CV_8UC3, [140, 110,  60]);
-                const hiA  = cv.matFromArray(1, 1, cv.CV_8UC3, [175, 255, 255]);
-                const loB  = cv.matFromArray(1, 1, cv.CV_8UC3, [  0, 110,  60]);
-                const hiB  = cv.matFromArray(1, 1, cv.CV_8UC3, [  5, 255, 255]);
-                maskLo = new cv.Mat();
-                maskHi = new cv.Mat();
-                cv.inRange(hsv, loA, hiA, maskLo);
-                cv.inRange(hsv, loB, hiB, maskHi);
-                loA.delete(); hiA.delete(); loB.delete(); hiB.delete();
+                rgbChans = new cv.MatVector();
+                cv.split(rgb, rgbChans);
+                rCh = rgbChans.get(0);
+                gCh = rgbChans.get(1);
+                bCh = rgbChans.get(2);
+
+                // Threshold each channel: R>120, G<100, B>120
+                maskR = new cv.Mat(); maskG = new cv.Mat(); maskB = new cv.Mat();
+                cv.threshold(rCh, maskR, 120, 255, cv.THRESH_BINARY);     // R bright
+                cv.threshold(gCh, maskG, 100, 255, cv.THRESH_BINARY_INV); // G dim
+                cv.threshold(bCh, maskB, 120, 255, cv.THRESH_BINARY);     // B bright
 
                 mask = new cv.Mat();
-                cv.bitwise_or(maskLo, maskHi, mask);
+                cv.bitwise_and(maskR, maskG, mask);
+                cv.bitwise_and(mask,  maskB, mask);
 
-                // Morphological close to fill camera JPEG / compression holes
+                // Morphological close to heal JPEG compression artefacts in marker
                 kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
                 closed = new cv.Mat();
                 cv.morphologyEx(mask, closed, cv.MORPH_CLOSE, kernel);
@@ -335,7 +344,36 @@
                 hierarchy = new cv.Mat();
                 cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-                const candidates = this._extractCandidates(contours, W, H);
+                let candidates = this._extractCandidates(contours, W, H);
+
+                // ── Pass 2 fallback: adaptive-threshold on grayscale ──────────────
+                // Covers edge-cases where camera auto-white-balance heavily washes
+                // out or shifts the magenta hue (e.g., warm incandescent light).
+                if (candidates.length < 4) {
+                    gray = new cv.Mat();
+                    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+                    blur = new cv.Mat();
+                    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+                    binary = new cv.Mat();
+                    const blockSize = Math.max(15, (Math.round(W / 25) | 1));
+                    cv.adaptiveThreshold(blur, binary, 255,
+                        cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, blockSize, 10);
+
+                    const kernel2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+                    const closed2 = new cv.Mat();
+                    cv.morphologyEx(binary, closed2, cv.MORPH_CLOSE, kernel2);
+
+                    contours.delete(); hierarchy.delete();
+                    contours  = new cv.MatVector();
+                    hierarchy = new cv.Mat();
+                    cv.findContours(closed2, contours, hierarchy,
+                        cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+                    closed2.delete(); kernel2.delete();
+
+                    const candidates2 = this._extractCandidates(contours, W, H);
+                    if (candidates2.length > candidates.length) candidates = candidates2;
+                }
+
                 this._lastCandidateCount = candidates.length;
                 if (candidates.length < 4) return null;
 
@@ -345,9 +383,11 @@
                 console.warn('[PhysicalRX] findMarkers:', e.message);
                 return null;
             } finally {
-                src?.delete(); rgb?.delete(); hsv?.delete();
-                maskLo?.delete(); maskHi?.delete(); mask?.delete();
-                closed?.delete(); kernel?.delete();
+                src?.delete(); rgb?.delete();
+                rgbChans?.delete(); rCh?.delete(); gCh?.delete(); bCh?.delete();
+                maskR?.delete(); maskG?.delete(); maskB?.delete();
+                mask?.delete(); closed?.delete(); kernel?.delete();
+                gray?.delete(); blur?.delete(); binary?.delete();
                 contours?.delete(); hierarchy?.delete();
             }
         }

@@ -1,34 +1,41 @@
 'use strict';
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN — Revised Stop-and-Wait ARQ
+// MAIN — Stop-and-Wait ARQ with adaptive (RTT-estimated) timing + SEQ numbers
 //
 // SENDER protocol:
 //   1. Show calibration frame → wait for READY tone from receiver.
-//   2. For each symbol (0..5):
-//      - Display symbol (clock toggles).
-//      - Wait for ACK (no time limit per symbol — wait up to 10×holdMs).
-//      - If ACK received → small gap → show next symbol.
-//      - If no ACK within 10×holdMs → assume link broken → restart from calib.
-//   3. After all 6 symbols shown → wait for final ACK or NACK (up to 10×holdMs).
-//      - ACK → DONE.
-//      - NACK → restart everything from calibration (without injecting error again).
+//   2. Encode message into 6 symbols (frame carries a 1-bit alternating SEQ).
+//   3. For each symbol (0..5):
+//      - Display symbol.
+//      - Wait for ACK. There is no fixed timeout — the deadline is derived from
+//        a running estimate of the round-trip time (symbol shown → ACK heard),
+//        so it self-adjusts to how fast/slow the acoustic link actually is.
+//      - ACK in time → small gap → show next symbol.
+//      - No ACK in time → assume the link dropped a tone → restart from
+//        calibration (retransmitting the *same* frame, SEQ unchanged, error
+//        bit re-injected the same way — nothing about the message changes).
+//   4. The ACK for the LAST symbol doubles as the receiver's "I decoded this
+//      frame successfully" signal — there is no separate final-ACK phase.
+//      A NACK at that point means the receiver's decode failed → restart.
+//   5. Only once the whole frame is acknowledged does the sender flip its SEQ
+//      bit, so a retransmit of the same message keeps the same SEQ.
 //
 // RECEIVER protocol:
-//   1. After calibration → send READY → enter LISTEN.
-//   2. On each new symbol (clock changes): accumulate bits, send ACK immediately.
-//   3. If clock does NOT change within 2×holdMs → assume sender is still on same
-//      symbol and re-send ACK (in case our previous ACK was missed).
-//   4. After accumulating 48 bits (PADDED_BITS):
-//      - If bit count is wrong → send NACK.
-//      - Try to parse frame → if parse fails → send NACK.
-//      - If parse succeeds → send final ACK → show result.
-//   5. NACK resets the receiver back to LISTEN state.
-//
-// KEY SIMPLIFICATIONS vs old code:
-//   - No per-symbol timeout that auto-advances the sender. Must get ACK or restart.
-//   - No NACK from receiver per symbol — only ACKs and a single final NACK.
-//   - Receiver retransmits ACK if it sees the same frame for too long (2×holdMs).
-//   - Final NACK only fires if bit count is wrong or frame fails to parse.
+//   1. After calibration → send READY → enter LISTEN (also starts measuring
+//      RTT from the moment READY is sent to the first symbol received).
+//   2. On each new symbol: accumulate bits.
+//      - If we don't yet have all 6 symbols → ACK it and restart a
+//        re-ACK interval (based on the estimated RTT) that keeps re-sending
+//        our last ACK in case the sender never heard it.
+//      - Once all 48 bits are in, try to parse the frame:
+//          - Parse fails → send NACK, go back to LISTEN.
+//          - Parse succeeds and SEQ matches the last frame we already
+//            decoded → this is a duplicate (our previous final ACK was
+//            lost) → just re-ACK, don't re-display the result.
+//          - Parse succeeds and it's a new SEQ → show the result, ACK it,
+//            remember the SEQ.
+//   3. If nothing decodes within an overall (RTT-derived) listen timeout,
+//      give up and send a final NACK.
 // ─────────────────────────────────────────────────────────────────────────────
 (function () {
 
@@ -146,24 +153,33 @@
     //  SENDER
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // How many times longer than holdMs we wait before giving up on an ACK.
-    // 10 RTT means 10 × holdMs.  A "round trip" here is: show symbol → receiver
-    // detects it → receiver plays ACK → sender hears ACK.  holdMs is the dwell
-    // time the receiver needs to reliably see the symbol, so 10× is very generous.
+    // A "round trip" here is: symbol shown → receiver detects it → receiver
+    // plays ACK → sender hears ACK. We keep a running estimate of that RTT and
+    // wait 10× it before assuming a tone got lost and restarting from
+    // calibration. The estimate is clamped so a couple of bad/missing samples
+    // can't make the timeout unreasonably short or long.
     const SENDER_ACK_RTT_MULTIPLIER = 10;
+    const RTT_MIN_MS = 5000 / SENDER_ACK_RTT_MULTIPLIER;   // timeout floor: 5s
+    const RTT_MAX_MS = 15000 / SENDER_ACK_RTT_MULTIPLIER;  // timeout ceiling: 15s (unused directly, kept for symmetry with getSenderTimeout)
 
     let TX   = null;  // PhysicalTX
     let SARX = null;  // AudioRX (sender side, listening for ACK/NACK/READY)
 
     // Sender state machine
-    let sState      = 'IDLE';
-    let sMsgBits    = [];
-    let sErrBit     = null;
-    let sRetransmit = false;   // true after first NACK — no error injection on retry
-    let sSymbols    = [];      // 6 encoded symbols
-    let sSymIdx     = 0;       // which symbol we are currently showing
-    let sAckTimer   = null;    // fires if ACK not received in time → restart
-    let sFinalTimer = null;    // fires if final ACK/NACK not received → restart
+    let sState       = 'IDLE';
+    let sMsgBits     = [];
+    let sErrBit      = null;
+    let sRetransmit  = false;   // true once we've had to restart at least once
+    let sSeq         = 0;       // 1-bit alternating sequence number for this message
+    let sSymbols     = [];      // 6 encoded symbols
+    let sSymIdx      = 0;       // which symbol we are currently showing
+    let sSymShowTime = 0;       // Date.now() when the current symbol was displayed
+    let sRttEstimate = 1500;    // running estimate of symbol→ACK round-trip time (ms)
+    let sAckTimer    = null;    // fires if ACK not received in time → restart
+
+    function getSenderTimeout() {
+        return Math.max(5000, Math.min(15000, SENDER_ACK_RTT_MULTIPLIER * sRttEstimate));
+    }
 
     function initSender() {
         const canvas = document.getElementById('tx-canvas');
@@ -179,11 +195,8 @@
             log('sender-log', ok ? 'Microphone ready.' : 'Mic unavailable — ACK detection disabled.', ok ? '' : 'warn');
         });
 
-        document.getElementById('msg-bits').oninput   = () => { sanitizeBits(); validateSender(); };
-        document.getElementById('error-bit').oninput  = validateSender;
-        document.getElementById('dwell-time').oninput = function () {
-            document.getElementById('dwell-val').textContent = this.value;
-        };
+        document.getElementById('msg-bits').oninput  = () => { sanitizeBits(); validateSender(); };
+        document.getElementById('error-bit').oninput = validateSender;
         document.getElementById('btn-show-calib').onclick   = onSenderStart;
         document.getElementById('btn-reset-sender').onclick = resetSender;
         document.getElementById('sender-back').onclick      = () => { cleanupSender(); show('screen-role'); };
@@ -213,28 +226,25 @@
     function setSenderState(st) {
         sState = st;
         const labels = {
-            IDLE:         ['IDLE',         'idle'],
-            CALIBRATE:    ['CALIBRATING',  'calib'],
-            TRANSMIT:     ['SENDING',      'active'],
-            SYM_GAP:      ['GAP',          'active'],
-            AWAIT_DECODE: ['AWAIT ACK',    'calib'],
-            DONE:         ['DONE',         'success'],
+            IDLE:      ['IDLE',        'idle'],
+            CALIBRATE: ['CALIBRATING', 'calib'],
+            ENCODE:    ['ENCODING',    'active'],
+            TRANSMIT:  ['SENDING',     'active'],
+            SYM_GAP:   ['GAP',         'active'],
+            DONE:      ['DONE',        'success'],
         };
         const [text, type] = labels[st] || [st, 'idle'];
         setBadge('sender-status-badge', text, type);
         validateSender();
     }
 
-    function getHoldMs() {
-        return parseInt(document.getElementById('dwell-time').value, 10) || 2000;
-    }
-
     function onSenderStart() {
         const bitsStr = document.getElementById('msg-bits').value;
         const errVal  = document.getElementById('error-bit').value.trim();
-        sMsgBits    = bitsStr.split('').map(Number);
-        sErrBit     = errVal !== '' ? parseInt(errVal, 10) : null;
-        sRetransmit = false;
+        sMsgBits     = bitsStr.split('').map(Number);
+        sErrBit      = errVal !== '' ? parseInt(errVal, 10) : null;
+        sRetransmit  = false;
+        sRttEstimate = 1500;
 
         if (sErrBit !== null && (sErrBit < 0 || sErrBit >= sMsgBits.length)) {
             alert('Error bit index ' + sErrBit + ' is out of range (0–' + (sMsgBits.length - 1) + ')');
@@ -247,7 +257,6 @@
 
     function showCalibFrame() {
         clearTimeout(sAckTimer);
-        clearTimeout(sFinalTimer);
         setSenderState('CALIBRATE');
         TX.drawCalibration();
         log('sender-log', 'Calibration frame shown. Waiting for READY tone from receiver…');
@@ -266,94 +275,102 @@
 
         } else if (sState === 'TRANSMIT') {
             if (tone === 'ACK') {
-                // Receiver got the symbol — move to the next one
                 clearTimeout(sAckTimer);
-                log('sender-log', 'ACK received for symbol ' + (sSymIdx + 1) + '.', 'success');
+
+                // Update our RTT estimate from how long this symbol took to ACK.
+                const measuredRtt = Date.now() - sSymShowTime;
+                if (measuredRtt > 0 && measuredRtt < 15000) {
+                    sRttEstimate = 0.7 * sRttEstimate + 0.3 * measuredRtt;
+                }
+
                 sSymIdx++;
-                setSenderState('SYM_GAP');
-                // Short gap so receiver's microphone doesn't pick up our tone
-                // from the previous symbol's ACK again
-                setTimeout(doTransmitNextSymbol, 800);
+                if (sSymIdx >= sSymbols.length) {
+                    // The ACK for the last symbol IS the receiver's "frame decoded
+                    // successfully" signal — there's no separate final-ACK phase.
+                    setSenderState('DONE');
+                    TX.drawIdle();
+                    sSeq ^= 1; // frame fully delivered — next message uses the other SEQ
+                    log('sender-log', 'Final symbol acknowledged — transmission complete!', 'success');
+                    setTimeout(() => {
+                        if (sState === 'DONE') setSenderState('IDLE');
+                    }, 3000);
+                } else {
+                    log('sender-log', 'ACK received for symbol ' + sSymIdx + ' (RTT: ' + measuredRtt + 'ms).', 'success');
+                    setSenderState('SYM_GAP');
+                    // Short gap so the receiver's microphone doesn't pick up our tone
+                    // from the previous symbol's ACK again
+                    setTimeout(doTransmitNextSymbol, 500);
+                }
+            } else if (tone === 'NACK') {
+                // Receiver finished collecting all 6 symbols but failed to decode
+                // the frame (bad SYNC/END or uncorrectable error) — retransmit.
+                clearTimeout(sAckTimer);
+                log('sender-log', 'NACK received — receiver could not decode the frame. Restarting…', 'warn');
+                doFullRestart();
             }
-            // Ignore NACK and READY during per-symbol transmission
+            // Ignore READY during per-symbol transmission
 
         } else if (sState === 'SYM_GAP') {
             // Deaf period — ignore all tones
-
-        } else if (sState === 'AWAIT_DECODE') {
-            if (tone === 'ACK') {
-                clearTimeout(sFinalTimer);
-                setSenderState('DONE');
-                TX.drawIdle();
-                log('sender-log', 'Final ACK — transmission complete!', 'success');
-                // Return to IDLE after a moment so user can send another message
-                setTimeout(() => setSenderState('IDLE'), 3000);
-
-            } else if (tone === 'NACK') {
-                clearTimeout(sFinalTimer);
-                log('sender-log', 'NACK received — bit count or parse error at receiver. Restarting…', 'warn');
-                sRetransmit = true;
-                showCalibFrame();
-            }
         }
     }
 
     function doEncode() {
-        // Build the 48-bit frame and split into 6 symbols.
-        // On retransmit we do not inject the artificial error (lab rule).
-        const errBit = sRetransmit ? null : sErrBit;
-        const bits48 = Framing.buildFrame(sMsgBits, errBit);
+        setSenderState('ENCODE');
+        // Build the 48-bit frame (SYNC | SEQ | Hamming codeword | END | padding)
+        // and split it into 6 symbols. The simulated error bit is injected on
+        // every attempt, retransmits included — retrying doesn't change the
+        // message, so it shouldn't change what error we asked to simulate.
+        const bits48 = Framing.buildFrame(sMsgBits, sErrBit, sSeq);
         sSymbols     = Framing.bitsToSymbols(bits48);
         sSymIdx      = 0;
-        log('sender-log', 'Encoded ' + sSymbols.length + ' symbols (error@bit ' + (errBit !== null ? errBit : 'none') + ')');
-        doTransmitNextSymbol();
+        log('sender-log', 'Encoded ' + sSymbols.length + ' symbols (SEQ=' + sSeq + ', error@bit ' + (sErrBit !== null ? sErrBit : 'none') + ')');
+
+        TX.drawIdle();
+        setTimeout(doTransmitNextSymbol, 300);
     }
 
     function doTransmitNextSymbol() {
         if (sSymIdx >= sSymbols.length) {
-            // All 6 symbols shown — wait for receiver's final ACK/NACK
-            setSenderState('AWAIT_DECODE');
+            setSenderState('DONE');
             TX.drawIdle();
-            log('sender-log', 'All symbols sent. Waiting for final ACK/NACK…');
-
-            // If we wait 10 RTT with no response, assume link is broken → restart
-            sFinalTimer = setTimeout(() => {
-                if (sState === 'AWAIT_DECODE') {
-                    log('sender-log', 'No final ACK/NACK after 10 RTT — restarting from calibration.', 'warn');
-                    sRetransmit = true;
-                    showCalibFrame();
-                }
-            }, SENDER_ACK_RTT_MULTIPLIER * getHoldMs());
             return;
         }
 
         setSenderState('TRANSMIT');
         TX.showSymbol(sSymbols[sSymIdx]);
+        sSymShowTime = Date.now();
+
+        const timeout = getSenderTimeout();
         log('sender-log', 'Showing symbol ' + (sSymIdx + 1) + '/' + sSymbols.length +
             '  cells=[' + sSymbols[sSymIdx].join(',') + ']');
 
-        // Wait up to 10×holdMs for an ACK.
-        // If none arrives, assume the link broke and restart from calibration.
-        // (Do NOT auto-advance — we need the ACK to be sure the receiver got it.)
+        // Wait for an ACK. The deadline adapts to the measured RTT instead of
+        // a fixed value, so it self-tunes to how responsive the acoustic link
+        // actually is. If nothing arrives in time, assume the link dropped a
+        // tone and restart the whole handshake from calibration.
         sAckTimer = setTimeout(() => {
             if (sState === 'TRANSMIT') {
-                log('sender-log',
-                    'No ACK for symbol ' + (sSymIdx + 1) + ' after ' +
-                    (SENDER_ACK_RTT_MULTIPLIER * getHoldMs() / 1000).toFixed(0) +
-                    's — assuming link broken. Restarting from calibration.', 'warn');
-                sRetransmit = true;
-                showCalibFrame();
+                log('sender-log', 'Symbol ' + (sSymIdx + 1) + ' timeout (' + Math.round(timeout / 1000) + 's). Restarting…', 'warn');
+                doFullRestart();
             }
-        }, SENDER_ACK_RTT_MULTIPLIER * getHoldMs());
+        }, timeout);
+    }
+
+    function doFullRestart() {
+        clearTimeout(sAckTimer);
+        sRetransmit = true;
+        log('sender-log', 'Retransmitting frame…', 'warn');
+        showCalibFrame();
     }
 
     function resetSender() {
         clearTimeout(sAckTimer);
-        clearTimeout(sFinalTimer);
-        if (TX) { TX.stop(); TX.drawIdle(); }
         setSenderState('IDLE');
-        sRetransmit = false;
-        sSymIdx     = 0;
+        if (TX) { TX.stop(); TX.drawIdle(); }
+        sRetransmit  = false;
+        sRttEstimate = 1500;
+        sSymIdx      = 0;
         document.getElementById('sender-log').innerHTML = '';
         log('sender-log', 'Reset.');
         validateSender();
@@ -361,7 +378,6 @@
 
     function cleanupSender() {
         clearTimeout(sAckTimer);
-        clearTimeout(sFinalTimer);
         if (TX)   TX.stop();
         if (SARX) SARX.stop();
     }
@@ -393,16 +409,24 @@
     //  RECEIVER
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // How many holdMs to wait before re-sending an ACK for the same symbol.
-    // If the clock hasn't changed in 2×holdMs, the sender probably didn't hear
-    // our ACK, so we send it again.
+    // How long (relative to the estimated RTT) to wait before re-sending an
+    // ACK for the current symbol, and how long overall to listen for a full
+    // frame before giving up and sending a final NACK. Both scale with the
+    // measured RTT instead of a fixed manual dwell time, so they self-tune to
+    // however fast/slow the acoustic link actually turns out to be.
     const RECEIVER_REACK_RTT_MULTIPLIER = 2;
+    const RECEIVER_LISTEN_RTT_MULTIPLIER = 10;
 
     let RX          = null;   // PhysicalRX
     let rState      = 'IDLE';
     let rBitBuf     = [];     // accumulated bits from all received symbols
     let rSymCount   = 0;      // how many symbols we've received
     let rReAckTimer = null;   // timer to re-send ACK if clock doesn't change
+    let rListenTimer = null;  // timer that gives up (sends NACK) if no full frame arrives
+    let rScreenFound = false; // whether the quad marker is currently locked
+    let rRttEstimate = 1500;  // running estimate of READY→first-symbol RTT (ms)
+    let rReadyTime   = 0;     // Date.now() when READY was last sent
+    let rLastDecodedSeq = null; // SEQ of the last frame we successfully decoded/displayed
     let _overlayCtx = null;
 
     function initReceiver() {
@@ -469,6 +493,7 @@
                 });
             }
             log('receiver-log', 'Sending READY tone to sender…');
+            rReadyTime = Date.now();
             AudioTX.playTone('READY').then(() => {
                 log('receiver-log', 'READY sent. Listening for symbols…');
                 startListening();
@@ -484,6 +509,25 @@
         clearTimeout(rReAckTimer);
         document.getElementById('rx-result-area').classList.add('hidden');
         log('receiver-log', 'Listening. Sender should now start transmitting symbols.');
+        startListenTimer();
+    }
+
+    function stopListenTimer() {
+        if (rListenTimer !== null) {
+            clearTimeout(rListenTimer);
+            rListenTimer = null;
+        }
+    }
+
+    function startListenTimer() {
+        stopListenTimer();
+        const timeout = Math.max(5000, Math.min(15000, RECEIVER_LISTEN_RTT_MULTIPLIER * rRttEstimate));
+        rListenTimer = setTimeout(() => {
+            if (rState === 'LISTEN') {
+                log('receiver-log', 'Listen timeout (' + Math.round(timeout / 1000) + 's) — no full frame arrived. Sending NACK.', 'warn');
+                sendFinalNack();
+            }
+        }, timeout);
     }
 
     // Called by PhysicalRX every time it detects a new symbol (clock edge).
@@ -502,6 +546,16 @@
 
         rSymCount++;
 
+        // The first symbol gives us a real measurement of READY→symbol RTT,
+        // which we use to size the re-ACK and overall listen timeouts.
+        if (rSymCount === 1 && rReadyTime > 0) {
+            const firstRtt = Date.now() - rReadyTime;
+            if (firstRtt > 0 && firstRtt < 15000) {
+                rRttEstimate = firstRtt;
+                log('receiver-log', 'Measured RTT: ' + Math.round(rRttEstimate) + 'ms');
+            }
+        }
+
         // Each cell is a color index 0-3 = 2 bits.
         for (const c of cells) {
             rBitBuf.push((c >> 1) & 1);
@@ -515,19 +569,21 @@
         document.getElementById('dbg-bits').textContent =
             (rBitBuf.length > 40 ? '…' : '') + rBitBuf.slice(-40).join('');
 
-        // Send ACK immediately so the sender knows to advance to the next symbol.
-        sendSymbolAck();
-
-        // Start a re-ACK timer: if the clock doesn't change within 2×holdMs,
-        // the sender probably didn't hear our ACK, so we send it again.
-        // This timer is reset each time we receive a new symbol.
-        clearTimeout(rReAckTimer);
-        scheduleReAck();
-
-        // After receiving all 6 symbols (48 bits), check and try to decode.
         if (rBitBuf.length >= Framing.PADDED_BITS) {
-            clearTimeout(rReAckTimer);   // no more re-ACKs once we're decoding
+            // All 6 symbols are in — stop re-ACKing/listening and try to decode.
+            // (No plain per-symbol ACK is sent for this last symbol: the ACK the
+            // sender needs now is the "frame decoded" ACK produced below.)
+            clearTimeout(rReAckTimer);
+            stopListenTimer();
             tryFinalDecode();
+        } else {
+            // Not done yet — ACK this symbol so the sender advances, and reset
+            // the overall listen timeout since we're clearly still connected.
+            stopListenTimer();
+            startListenTimer();
+            sendSymbolAck();
+            clearTimeout(rReAckTimer);
+            scheduleReAck();
         }
     }
 
@@ -538,21 +594,22 @@
     }
 
     function scheduleReAck() {
-        // We need the sender's hold time to know when to re-ACK.
-        // The receiver doesn't have a hold-time slider, so we use a reasonable
-        // default.  In practice the sender and receiver are configured the same.
-        // We look at the sender's dwell slider only if this page is also the sender
-        // (single-device testing).  Otherwise fall back to 2000 ms.
-        const dwellEl = document.getElementById('dwell-time');
-        const holdMs  = dwellEl ? (parseInt(dwellEl.value, 10) || 2000) : 2000;
-        const reAckMs = RECEIVER_REACK_RTT_MULTIPLIER * holdMs;
+        // If the clock doesn't change within this window, the sender probably
+        // didn't hear our ACK, so we send it again. The window scales with
+        // the measured RTT rather than a fixed manual dwell time.
+        const reAckMs = Math.max(1500, Math.min(6000, RECEIVER_REACK_RTT_MULTIPLIER * rRttEstimate));
 
         rReAckTimer = setTimeout(() => {
             if (rState !== 'LISTEN') return;
+            if (!rScreenFound) {
+                log('receiver-log', 'ACK retransmit deferred — screen tracking lost.', 'warn');
+                scheduleReAck();
+                return;
+            }
             // Clock hasn't changed — sender is probably stuck waiting for our ACK.
-            log('receiver-log', 'Clock unchanged for ' + reAckMs + 'ms — re-sending ACK.', 'warn');
+            log('receiver-log', 'Clock unchanged for ' + Math.round(reAckMs) + 'ms — re-sending ACK.', 'warn');
             sendSymbolAck();
-            // Keep re-ACKing every reAckMs until we get a new symbol or done.
+            // Keep re-ACKing until we get a new symbol or finish.
             scheduleReAck();
         }, reAckMs);
     }
@@ -564,21 +621,32 @@
             log('receiver-log',
                 'Bit count wrong: got ' + rBitBuf.length + ' expected ' + Framing.PADDED_BITS +
                 ' — sending NACK.', 'warn');
-            sendNackAndReset();
+            sendFinalNack();
             return;
         }
 
         // Try to find and decode the frame in the bit buffer.
         const result = Framing.parseFrame(rBitBuf);
-        if (!result) {
-            log('receiver-log', 'Frame parse failed (SYNC/END not found or Hamming gave L>20) — sending NACK.', 'warn');
-            sendNackAndReset();
+        if (!result || result.L < 1 || result.L > 20 || result.messageBits.length !== result.L) {
+            log('receiver-log', 'Frame validation failed (SYNC/END/parity error) — sending NACK.', 'error');
+            sendFinalNack();
             return;
         }
 
-        // Success!
+        if (result.seq === rLastDecodedSeq) {
+            // We've already shown this exact frame — the sender must be
+            // retransmitting because our earlier final ACK got lost. Just
+            // re-ACK it; don't process or re-display the result.
+            log('receiver-log', 'Duplicate frame detected (SEQ=' + result.seq + '). Re-ACKing.', 'warn');
+            AudioTX.playTone('ACK');
+            document.getElementById('btn-calibrate').disabled = false;
+            return;
+        }
+
+        // A genuinely new frame — success!
+        rLastDecodedSeq = result.seq;
         setRxState('DONE');
-        log('receiver-log', 'Frame decoded! L=' + result.L + '  msg=' + result.messageBits.join(''), 'success');
+        log('receiver-log', 'Frame decoded! SEQ=' + result.seq + '  L=' + result.L + '  msg=' + result.messageBits.join(''), 'success');
 
         if (result.errorMsgBitIdx !== null) {
             log('receiver-log', 'Error corrected at message bit ' + result.errorMsgBitIdx, 'warn');
@@ -590,22 +658,22 @@
 
         showResult(result);
 
-        // Give a small delay so our last symbol-ACK has time to clear the air,
-        // then send the final ACK to tell the sender we are done.
-        setTimeout(() => {
-            AudioTX.playTone('ACK').then(() => {
-                log('receiver-log', 'Final ACK sent — transmission complete.');
-            });
-        }, 1200);
+        AudioTX.playTone('ACK').then(() => {
+            log('receiver-log', 'Final ACK sent. Ready for next transmission.', 'success');
+            document.getElementById('btn-calibrate').disabled = false;
+        });
     }
 
-    function sendNackAndReset() {
+    function sendFinalNack() {
+        clearTimeout(rReAckTimer);
+        stopListenTimer();
+        setRxState('CAMERA ON');
         AudioTX.playTone('NACK').then(() => {
-            log('receiver-log', 'NACK sent. Resetting to LISTEN — waiting for retransmit…');
+            log('receiver-log', 'NACK sent. Waiting for sender to restart…', 'warn');
             rBitBuf   = [];
             rSymCount = 0;
             if (RX) RX.resetClock();
-            startListening();
+            document.getElementById('btn-calibrate').disabled = false;
         });
     }
 
@@ -645,6 +713,7 @@
 
     function updateDebugPanel(info) {
         const found = info.screenFound;
+        rScreenFound = found;
         document.getElementById('dbg-markers').textContent =
             found ? '4/4 detected' : 'searching… (' + (info.candidateCount || 0) + ' candidates)';
 
@@ -698,8 +767,11 @@
 
     function resetReceiver() {
         clearTimeout(rReAckTimer);
-        rBitBuf   = [];
-        rSymCount = 0;
+        stopListenTimer();
+        rLastDecodedSeq = null;
+        rBitBuf      = [];
+        rSymCount    = 0;
+        rRttEstimate = 1500;
         setRxState('IDLE');
         document.getElementById('rx-result-area').classList.add('hidden');
         document.getElementById('receiver-log').innerHTML = '';
@@ -718,6 +790,7 @@
 
     function cleanupReceiver() {
         clearTimeout(rReAckTimer);
+        stopListenTimer();
         if (RX) RX.stop();
     }
 

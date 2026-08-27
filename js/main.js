@@ -452,8 +452,9 @@
         if (rState !== 'LISTEN') return;
 
         // PhysicalRX fires on a clock edge regardless of warp quality.
-        // If the camera didn't have a solid quad lock at the moment of capture,
-        // the cell colours are garbage — drop the symbol and don't ACK.
+        // If the camera didn't have a solid quad lock at capture time,
+        // cell colours are garbage — drop the symbol silently, don't ACK.
+        // The sender stays on the same symbol until we get a clean read.
         if (!RX || !RX._lastWarpOk) {
             log('receiver-log', 'Symbol ignored — no quad lock at capture time.', 'warn');
             return;

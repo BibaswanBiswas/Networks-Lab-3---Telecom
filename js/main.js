@@ -1,36 +1,54 @@
 'use strict';
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN — Stop-and-Wait ARQ protocol with per-symbol ACK pacing
+// MAIN — Revised Stop-and-Wait ARQ
 //
-// Protocol:
-//   1. Sender shows calibration frame → Receiver calibrates → sends READY
+// SENDER protocol:
+//   1. Show calibration frame → wait for READY tone from receiver.
 //   2. For each symbol (0..5):
-//      - Sender: toggle clock, display symbol, wait for ACK (up to holdMs)
-//      - Receiver: detects clock change → reads symbol → plays ACK
-//      - Sender hears ACK → 500ms gap → next symbol
-//      - Sender timeout → advance anyway (holdMs was long enough)
-//   3. After all 6 symbols shown:
-//      - Sender goes to AWAIT_DECODE state
-//      - Receiver decodes accumulated bits
-//      - If decode OK → plays ACK → Sender DONE
-//      - If decode fails → plays NACK → Sender retransmits everything
+//      - Display symbol (clock toggles).
+//      - Wait for ACK (no time limit per symbol — wait up to 10×holdMs).
+//      - If ACK received → small gap → show next symbol.
+//      - If no ACK within 10×holdMs → assume link broken → restart from calib.
+//   3. After all 6 symbols shown → wait for final ACK or NACK (up to 10×holdMs).
+//      - ACK → DONE.
+//      - NACK → restart everything from calibration (without injecting error again).
+//
+// RECEIVER protocol:
+//   1. After calibration → send READY → enter LISTEN.
+//   2. On each new symbol (clock changes): accumulate bits, send ACK immediately.
+//   3. If clock does NOT change within 2×holdMs → assume sender is still on same
+//      symbol and re-send ACK (in case our previous ACK was missed).
+//   4. After accumulating 48 bits (PADDED_BITS):
+//      - If bit count is wrong → send NACK.
+//      - Try to parse frame → if parse fails → send NACK.
+//      - If parse succeeds → send final ACK → show result.
+//   5. NACK resets the receiver back to LISTEN state.
+//
+// KEY SIMPLIFICATIONS vs old code:
+//   - No per-symbol timeout that auto-advances the sender. Must get ACK or restart.
+//   - No NACK from receiver per symbol — only ACKs and a single final NACK.
+//   - Receiver retransmits ACK if it sees the same frame for too long (2×holdMs).
+//   - Final NACK only fires if bit count is wrong or frame fails to parse.
 // ─────────────────────────────────────────────────────────────────────────────
 (function () {
+
+    // ── Small helper utilities ────────────────────────────────────────────────
 
     function show(id) {
         document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
         document.getElementById(id).classList.add('active');
     }
 
-    function log(panelId, msg, type = '') {
+    function log(panelId, msg, type) {
         const el = document.getElementById(panelId);
         if (!el) return;
         const line = document.createElement('div');
         line.className = 'log-line' + (type ? ' ' + type : '');
         const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        line.textContent = `[${ts}] ${msg}`;
+        line.textContent = '[' + ts + '] ' + msg;
         el.appendChild(line);
         el.scrollTop = el.scrollHeight;
+        // Keep log from growing forever
         while (el.children.length > 80) el.removeChild(el.firstChild);
     }
 
@@ -49,7 +67,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  HOME
+    //  HOME — permissions + OpenCV status
     // ═══════════════════════════════════════════════════════════════════════════
     let _permGranted = false, _cvOk = false;
 
@@ -72,6 +90,7 @@
             setDot('cv-dot', 'cv-state', true, 'ready');
             checkUnlock();
         });
+        // Fallback poll in case the event already fired before we registered
         const poll = setInterval(() => {
             if (window._cvReady) {
                 clearInterval(poll);
@@ -101,15 +120,10 @@
             hint.style.color = 'var(--success)';
             checkUnlock();
         } catch (e) {
+            // Try individually
             let camOk = false, micOk = false;
-            try {
-                const cs = await navigator.mediaDevices.getUserMedia({ video: true });
-                cs.getTracks().forEach(t => t.stop()); camOk = true;
-            } catch (_) {}
-            try {
-                const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
-                ms.getTracks().forEach(t => t.stop()); micOk = true;
-            } catch (_) {}
+            try { const cs = await navigator.mediaDevices.getUserMedia({ video: true }); cs.getTracks().forEach(t => t.stop()); camOk = true; } catch (_) {}
+            try { const ms = await navigator.mediaDevices.getUserMedia({ audio: true }); ms.getTracks().forEach(t => t.stop()); micOk = true; } catch (_) {}
             setDot('cam-dot', 'cam-state', camOk, camOk ? 'granted' : 'denied');
             setDot('mic-dot', 'mic-state', micOk, micOk ? 'granted' : 'denied');
             if (camOk && micOk) {
@@ -129,17 +143,27 @@
     initCvStatus();
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  SENDER  (Stop-and-Wait, per-symbol ACK pacing)
+    //  SENDER
     // ═══════════════════════════════════════════════════════════════════════════
-    let TX = null, SARX = null;
+
+    // How many times longer than holdMs we wait before giving up on an ACK.
+    // 10 RTT means 10 × holdMs.  A "round trip" here is: show symbol → receiver
+    // detects it → receiver plays ACK → sender hears ACK.  holdMs is the dwell
+    // time the receiver needs to reliably see the symbol, so 10× is very generous.
+    const SENDER_ACK_RTT_MULTIPLIER = 10;
+
+    let TX   = null;  // PhysicalTX
+    let SARX = null;  // AudioRX (sender side, listening for ACK/NACK/READY)
+
+    // Sender state machine
     let sState      = 'IDLE';
     let sMsgBits    = [];
     let sErrBit     = null;
-    let sRetransmit = false;
-    let sSymbols    = [];      // the 6 encoded symbols
-    let sSymIdx     = 0;       // current symbol index being shown
-    let sSymTimer   = null;    // per-symbol hold timeout
-    let sDecodeTimer = null;   // final ACK/NACK timeout
+    let sRetransmit = false;   // true after first NACK — no error injection on retry
+    let sSymbols    = [];      // 6 encoded symbols
+    let sSymIdx     = 0;       // which symbol we are currently showing
+    let sAckTimer   = null;    // fires if ACK not received in time → restart
+    let sFinalTimer = null;    // fires if final ACK/NACK not received → restart
 
     function initSender() {
         const canvas = document.getElementById('tx-canvas');
@@ -152,9 +176,7 @@
 
         SARX.onTone = onSenderTone;
         SARX.start().then(ok => {
-            log('sender-log', ok
-                ? 'Microphone ready — listening for tones.'
-                : 'Mic unavailable. ACK/NACK detection disabled.', ok ? '' : 'warn');
+            log('sender-log', ok ? 'Microphone ready.' : 'Mic unavailable — ACK detection disabled.', ok ? '' : 'warn');
         });
 
         document.getElementById('msg-bits').oninput   = () => { sanitizeBits(); validateSender(); };
@@ -168,8 +190,8 @@
 
         document.getElementById('btn-fullscreen').onclick = () => {
             const w = document.getElementById('tx-canvas-wrapper');
-            if (!document.fullscreenElement) w.requestFullscreen?.().catch(() => {});
-            else document.exitFullscreen?.();
+            if (!document.fullscreenElement) w.requestFullscreen && w.requestFullscreen().catch(() => {});
+            else document.exitFullscreen && document.exitFullscreen();
         };
 
         setSenderState('IDLE');
@@ -184,19 +206,19 @@
 
     function validateSender() {
         const bits = document.getElementById('msg-bits').value;
-        document.getElementById('btn-show-calib').disabled = !(bits.length > 0 && bits.length <= 20 && sState === 'IDLE');
+        document.getElementById('btn-show-calib').disabled =
+            !(bits.length > 0 && bits.length <= 20 && sState === 'IDLE');
     }
 
     function setSenderState(st) {
         sState = st;
         const labels = {
-            IDLE:         ['IDLE',              'idle'],
-            CALIBRATE:    ['CALIBRATE',         'calib'],
-            ENCODE:       ['ENCODE',            'active'],
-            TRANSMIT:     ['SENDING SYM',       'active'],
-            SYM_GAP:      ['GAP',               'active'],   // deaf between symbols
-            AWAIT_DECODE: ['AWAIT DECODE',      'calib'],
-            DONE:         ['DONE',              'success'],
+            IDLE:         ['IDLE',         'idle'],
+            CALIBRATE:    ['CALIBRATING',  'calib'],
+            TRANSMIT:     ['SENDING',      'active'],
+            SYM_GAP:      ['GAP',          'active'],
+            AWAIT_DECODE: ['AWAIT ACK',    'calib'],
+            DONE:         ['DONE',         'success'],
         };
         const [text, type] = labels[st] || [st, 'idle'];
         setBadge('sender-status-badge', text, type);
@@ -215,124 +237,136 @@
         sRetransmit = false;
 
         if (sErrBit !== null && (sErrBit < 0 || sErrBit >= sMsgBits.length)) {
-            alert(`Error bit index ${sErrBit} is out of range (0–${sMsgBits.length - 1})`);
+            alert('Error bit index ' + sErrBit + ' is out of range (0–' + (sMsgBits.length - 1) + ')');
             return;
         }
 
-        log('sender-log', `Message: ${bitsStr}  L=${sMsgBits.length}  error-bit: ${sErrBit ?? 'none'}`);
+        log('sender-log', 'Message: ' + bitsStr + '  L=' + sMsgBits.length + '  error-bit: ' + (sErrBit !== null ? sErrBit : 'none'));
         showCalibFrame();
     }
 
     function showCalibFrame() {
+        clearTimeout(sAckTimer);
+        clearTimeout(sFinalTimer);
         setSenderState('CALIBRATE');
         TX.drawCalibration();
-        log('sender-log', 'Calibration frame displayed. Waiting for READY tone…');
+        log('sender-log', 'Calibration frame shown. Waiting for READY tone from receiver…');
+        // No timeout on calibration — wait indefinitely for receiver to be ready.
     }
 
     function onSenderTone(tone) {
-        log('sender-log', `Received tone: ${tone}`);
+        log('sender-log', 'Heard tone: ' + tone);
 
-        switch (sState) {
-            case 'CALIBRATE':
-                if (tone === 'READY') doEncode();
-                break;
+        if (sState === 'CALIBRATE') {
+            if (tone === 'READY') {
+                // Receiver is calibrated and ready — start encoding and sending
+                doEncode();
+            }
+            // Ignore anything else during calibration
 
-            case 'TRANSMIT':
-                // Per-symbol ACK from receiver — advance to next symbol
-                if (tone === 'ACK') {
-                    clearTimeout(sSymTimer);
-                    log('sender-log', `  Symbol ${sSymIdx + 1} ACK'd.`, 'success');
-                    sSymIdx++;
-                    // Enter SYM_GAP: deaf period to prevent ACK carry-over
-                    setSenderState('SYM_GAP');
-                    setTimeout(doTransmitNextSymbol, 800);
-                }
-                break;
+        } else if (sState === 'TRANSMIT') {
+            if (tone === 'ACK') {
+                // Receiver got the symbol — move to the next one
+                clearTimeout(sAckTimer);
+                log('sender-log', 'ACK received for symbol ' + (sSymIdx + 1) + '.', 'success');
+                sSymIdx++;
+                setSenderState('SYM_GAP');
+                // Short gap so receiver's microphone doesn't pick up our tone
+                // from the previous symbol's ACK again
+                setTimeout(doTransmitNextSymbol, 800);
+            }
+            // Ignore NACK and READY during per-symbol transmission
 
-            case 'SYM_GAP':
-                // DEAF — ignore all tones during inter-symbol gap
-                // This prevents the previous ACK from being detected again
-                break;
+        } else if (sState === 'SYM_GAP') {
+            // Deaf period — ignore all tones
 
-            case 'AWAIT_DECODE':
-                // Final message-level ACK or NACK from receiver
-                clearTimeout(sDecodeTimer);
-                if (tone === 'ACK') {
-                    setSenderState('DONE');
-                    TX.drawIdle();
-                    log('sender-log', 'Final ACK — transmission complete.', 'success');
-                    setTimeout(() => setSenderState('IDLE'), 3000);
-                } else if (tone === 'NACK') {
-                    log('sender-log', 'NACK — receiver could not decode. Retransmitting…', 'warn');
-                    doRetransmitAll();
-                }
-                break;
+        } else if (sState === 'AWAIT_DECODE') {
+            if (tone === 'ACK') {
+                clearTimeout(sFinalTimer);
+                setSenderState('DONE');
+                TX.drawIdle();
+                log('sender-log', 'Final ACK — transmission complete!', 'success');
+                // Return to IDLE after a moment so user can send another message
+                setTimeout(() => setSenderState('IDLE'), 3000);
+
+            } else if (tone === 'NACK') {
+                clearTimeout(sFinalTimer);
+                log('sender-log', 'NACK received — bit count or parse error at receiver. Restarting…', 'warn');
+                sRetransmit = true;
+                showCalibFrame();
+            }
         }
     }
 
     function doEncode() {
-        setSenderState('ENCODE');
-        const errBit  = sRetransmit ? null : sErrBit;
-        const bits48  = Framing.buildFrame(sMsgBits, errBit);
-        sSymbols      = Framing.bitsToSymbols(bits48);
-        sSymIdx       = 0;
-        log('sender-log', `Encoded ${sSymbols.length} symbols (error@bit ${errBit ?? 'none'})`);
+        // Build the 48-bit frame and split into 6 symbols.
+        // On retransmit we do not inject the artificial error (lab rule).
+        const errBit = sRetransmit ? null : sErrBit;
+        const bits48 = Framing.buildFrame(sMsgBits, errBit);
+        sSymbols     = Framing.bitsToSymbols(bits48);
+        sSymIdx      = 0;
+        log('sender-log', 'Encoded ' + sSymbols.length + ' symbols (error@bit ' + (errBit !== null ? errBit : 'none') + ')');
         doTransmitNextSymbol();
     }
 
     function doTransmitNextSymbol() {
         if (sSymIdx >= sSymbols.length) {
-            // All symbols shown → wait for final decode ACK/NACK
+            // All 6 symbols shown — wait for receiver's final ACK/NACK
             setSenderState('AWAIT_DECODE');
             TX.drawIdle();
-            log('sender-log', 'All symbols sent. Awaiting decode result (10 s timeout)…');
-            sDecodeTimer = setTimeout(() => {
+            log('sender-log', 'All symbols sent. Waiting for final ACK/NACK…');
+
+            // If we wait 10 RTT with no response, assume link is broken → restart
+            sFinalTimer = setTimeout(() => {
                 if (sState === 'AWAIT_DECODE') {
-                    log('sender-log', 'Decode timeout — retransmitting…', 'warn');
-                    doRetransmitAll();
+                    log('sender-log', 'No final ACK/NACK after 10 RTT — restarting from calibration.', 'warn');
+                    sRetransmit = true;
+                    showCalibFrame();
                 }
-            }, 10000);
+            }, SENDER_ACK_RTT_MULTIPLIER * getHoldMs());
             return;
         }
 
         setSenderState('TRANSMIT');
         TX.showSymbol(sSymbols[sSymIdx]);
-        log('sender-log', `Showing symbol ${sSymIdx + 1}/${sSymbols.length}  [${sSymbols[sSymIdx].join(',')}]  hold=${getHoldMs()}ms`);
+        log('sender-log', 'Showing symbol ' + (sSymIdx + 1) + '/' + sSymbols.length +
+            '  cells=[' + sSymbols[sSymIdx].join(',') + ']');
 
-        // Wait up to holdMs for ACK. If no ACK, advance anyway.
-        sSymTimer = setTimeout(() => {
-            log('sender-log', `  Symbol ${sSymIdx + 1} — no ACK received, advancing.`, 'warn');
-            sSymIdx++;
-            // Still use SYM_GAP even on timeout to keep timing consistent
-            setSenderState('SYM_GAP');
-            setTimeout(doTransmitNextSymbol, 800);
-        }, getHoldMs());
-    }
-
-    function doRetransmitAll() {
-        sRetransmit = true;
-        showCalibFrame();
+        // Wait up to 10×holdMs for an ACK.
+        // If none arrives, assume the link broke and restart from calibration.
+        // (Do NOT auto-advance — we need the ACK to be sure the receiver got it.)
+        sAckTimer = setTimeout(() => {
+            if (sState === 'TRANSMIT') {
+                log('sender-log',
+                    'No ACK for symbol ' + (sSymIdx + 1) + ' after ' +
+                    (SENDER_ACK_RTT_MULTIPLIER * getHoldMs() / 1000).toFixed(0) +
+                    's — assuming link broken. Restarting from calibration.', 'warn');
+                sRetransmit = true;
+                showCalibFrame();
+            }
+        }, SENDER_ACK_RTT_MULTIPLIER * getHoldMs());
     }
 
     function resetSender() {
-        clearTimeout(sSymTimer);
-        clearTimeout(sDecodeTimer);
+        clearTimeout(sAckTimer);
+        clearTimeout(sFinalTimer);
+        if (TX) { TX.stop(); TX.drawIdle(); }
         setSenderState('IDLE');
-        if (TX) TX.stop();
-        TX && TX.drawIdle();
-        document.getElementById('sender-log').innerHTML = '';
         sRetransmit = false;
+        sSymIdx     = 0;
+        document.getElementById('sender-log').innerHTML = '';
         log('sender-log', 'Reset.');
         validateSender();
     }
 
     function cleanupSender() {
-        clearTimeout(sSymTimer);
-        clearTimeout(sDecodeTimer);
+        clearTimeout(sAckTimer);
+        clearTimeout(sFinalTimer);
         if (TX)   TX.stop();
         if (SARX) SARX.stop();
     }
 
+    // Redraw canvas on fullscreen / resize
     document.addEventListener('fullscreenchange', () => {
         if (TX && document.querySelector('#screen-sender.active')) {
             const canvas = document.getElementById('tx-canvas');
@@ -345,7 +379,6 @@
             else TX.drawIdle();
         }
     });
-
     window.addEventListener('resize', () => {
         if (TX && document.querySelector('#screen-sender.active') && !document.fullscreenElement) {
             const canvas = document.getElementById('tx-canvas');
@@ -357,10 +390,20 @@
     });
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  RECEIVER  (per-symbol ACK, final decode ACK/NACK)
+    //  RECEIVER
     // ═══════════════════════════════════════════════════════════════════════════
-    let RX = null, rState = 'IDLE', rBitBuf = [], rSymCount = 0;
-    let rListenTimer = null, _overlayCtx = null;
+
+    // How many holdMs to wait before re-sending an ACK for the same symbol.
+    // If the clock hasn't changed in 2×holdMs, the sender probably didn't hear
+    // our ACK, so we send it again.
+    const RECEIVER_REACK_RTT_MULTIPLIER = 2;
+
+    let RX          = null;   // PhysicalRX
+    let rState      = 'IDLE';
+    let rBitBuf     = [];     // accumulated bits from all received symbols
+    let rSymCount   = 0;      // how many symbols we've received
+    let rReAckTimer = null;   // timer to re-send ACK if clock doesn't change
+    let _overlayCtx = null;
 
     function initReceiver() {
         RX = null; rState = 'IDLE'; rBitBuf = []; rSymCount = 0;
@@ -372,18 +415,17 @@
         document.getElementById('receiver-back').onclick      = () => { cleanupReceiver(); show('screen-role'); };
 
         setRxState('IDLE');
-        log('receiver-log', 'Receiver ready. Start camera to begin.');
+        log('receiver-log', 'Receiver ready. Start camera first.');
     }
 
     function setRxState(st) {
         rState = st;
         const labels = {
-            IDLE:        ['IDLE',         'idle'],
-            'CAMERA ON': ['CAMERA ON',    'active'],
-            CALIBRATING: ['CALIBRATING',  'calib'],
-            LISTEN:      ['LISTENING',    'active'],
-            DECODING:    ['DECODING',     'calib'],
-            DONE:        ['DONE',         'success'],
+            IDLE:        ['IDLE',        'idle'],
+            'CAMERA ON': ['CAMERA ON',   'active'],
+            CALIBRATING: ['CALIBRATING', 'calib'],
+            LISTEN:      ['LISTENING',   'active'],
+            DONE:        ['DONE',        'success'],
         };
         const [text, type] = labels[st] || [st, 'idle'];
         setBadge('receiver-status-badge', text, type);
@@ -401,7 +443,7 @@
             document.getElementById('btn-calibrate').disabled = false;
             document.getElementById('camera-hint').style.display = 'none';
             setRxState('CAMERA ON');
-            log('receiver-log', 'Camera started. Aim at sender screen, then press Calibrate.');
+            log('receiver-log', 'Camera started. Aim at the sender screen, then press Calibrate.');
         } else {
             log('receiver-log', 'Camera access denied.', 'error');
             document.getElementById('btn-start-camera').disabled = false;
@@ -418,16 +460,17 @@
         setRxState('CALIBRATING');
         log('receiver-log', 'Sampling calibration colours (30 frames)…');
         RX.startCalibration(() => {
-            log('receiver-log', 'Calibration complete.', 'success');
-            log('receiver-log', `  Clock midpoint luma: ${RX.clockMidLuma.toFixed(1)}`);
+            log('receiver-log', 'Calibration done.', 'success');
+            log('receiver-log', 'Clock midpoint luma: ' + RX.clockMidLuma.toFixed(1));
             if (RX.refColors) {
                 RX.refColors.forEach((c, i) => {
-                    log('receiver-log', `  Ref[${Framing.COLOR_NAMES[i]}]: R=${c.r.toFixed(0)} G=${c.g.toFixed(0)} B=${c.b.toFixed(0)}`);
+                    log('receiver-log', 'Ref[' + Framing.COLOR_NAMES[i] + ']: R=' +
+                        c.r.toFixed(0) + ' G=' + c.g.toFixed(0) + ' B=' + c.b.toFixed(0));
                 });
             }
-            log('receiver-log', 'Sending READY tone…');
+            log('receiver-log', 'Sending READY tone to sender…');
             AudioTX.playTone('READY').then(() => {
-                log('receiver-log', 'READY tone sent. Listening for symbols…');
+                log('receiver-log', 'READY sent. Listening for symbols…');
                 startListening();
             });
         });
@@ -435,26 +478,23 @@
 
     function startListening() {
         setRxState('LISTEN');
-        rBitBuf = []; rSymCount = 0;
+        rBitBuf   = [];
+        rSymCount = 0;
         RX.resetClock();
+        clearTimeout(rReAckTimer);
         document.getElementById('rx-result-area').classList.add('hidden');
-
-        // Overall timeout — if we haven't decoded after 60 seconds, give up
-        rListenTimer = setTimeout(() => {
-            if (rState === 'LISTEN') {
-                log('receiver-log', 'Listen timeout (60s). Sending NACK.', 'warn');
-                sendFinalNack();
-            }
-        }, 60000);
+        log('receiver-log', 'Listening. Sender should now start transmitting symbols.');
     }
 
+    // Called by PhysicalRX every time it detects a new symbol (clock edge).
     function onNewSymbol(cells) {
         if (rState !== 'LISTEN') return;
 
         // PhysicalRX fires on a clock edge regardless of warp quality.
         // If the camera didn't have a solid quad lock at capture time,
-        // cell colours are garbage — drop the symbol silently, don't ACK.
-        // The sender stays on the same symbol until we get a clean read.
+        // the cell colours are garbage — drop the symbol, don't ACK.
+        // The re-ACK timer (scheduleReAck) will keep nudging the sender
+        // with our last ACK until we get a clean read of the next symbol.
         if (!RX || !RX._lastWarpOk) {
             log('receiver-log', 'Symbol ignored — no quad lock at capture time.', 'warn');
             return;
@@ -462,54 +502,111 @@
 
         rSymCount++;
 
-        // Accumulate bits: 4 cells × 2 bits each = 8 bits per symbol
+        // Each cell is a color index 0-3 = 2 bits.
         for (const c of cells) {
             rBitBuf.push((c >> 1) & 1);
             rBitBuf.push(c & 1);
         }
 
-        log('receiver-log', `Symbol ${rSymCount} received: [${cells.map(c => Framing.COLOR_NAMES[c]).join(', ')}]`);
+        log('receiver-log', 'Symbol ' + rSymCount + ' received: [' +
+            cells.map(c => Framing.COLOR_NAMES[c]).join(', ') + ']');
 
         document.getElementById('dbg-symbols').textContent = rSymCount;
         document.getElementById('dbg-bits').textContent =
             (rBitBuf.length > 40 ? '…' : '') + rBitBuf.slice(-40).join('');
 
-        // Send per-symbol ACK so sender knows to advance
-        AudioTX.playTone('ACK').then(() => {
-            log('receiver-log', `  ACK sent for symbol ${rSymCount}.`);
-        });
+        // Send ACK immediately so the sender knows to advance to the next symbol.
+        sendSymbolAck();
 
-        // After accumulating enough bits, try to decode the frame
-        if (rBitBuf.length >= Framing.FRAME_BITS) {
-            const result = Framing.parseFrame(rBitBuf);
-            if (result) {
-                clearTimeout(rListenTimer);
-                handleDecodeSuccess(result);
-            }
+        // Start a re-ACK timer: if the clock doesn't change within 2×holdMs,
+        // the sender probably didn't hear our ACK, so we send it again.
+        // This timer is reset each time we receive a new symbol.
+        clearTimeout(rReAckTimer);
+        scheduleReAck();
+
+        // After receiving all 6 symbols (48 bits), check and try to decode.
+        if (rBitBuf.length >= Framing.PADDED_BITS) {
+            clearTimeout(rReAckTimer);   // no more re-ACKs once we're decoding
+            tryFinalDecode();
         }
     }
 
-    function handleDecodeSuccess(result) {
+    function sendSymbolAck() {
+        AudioTX.playTone('ACK').then(() => {
+            log('receiver-log', 'ACK sent (symbol ' + rSymCount + ').');
+        });
+    }
+
+    function scheduleReAck() {
+        // We need the sender's hold time to know when to re-ACK.
+        // The receiver doesn't have a hold-time slider, so we use a reasonable
+        // default.  In practice the sender and receiver are configured the same.
+        // We look at the sender's dwell slider only if this page is also the sender
+        // (single-device testing).  Otherwise fall back to 2000 ms.
+        const dwellEl = document.getElementById('dwell-time');
+        const holdMs  = dwellEl ? (parseInt(dwellEl.value, 10) || 2000) : 2000;
+        const reAckMs = RECEIVER_REACK_RTT_MULTIPLIER * holdMs;
+
+        rReAckTimer = setTimeout(() => {
+            if (rState !== 'LISTEN') return;
+            // Clock hasn't changed — sender is probably stuck waiting for our ACK.
+            log('receiver-log', 'Clock unchanged for ' + reAckMs + 'ms — re-sending ACK.', 'warn');
+            sendSymbolAck();
+            // Keep re-ACKing every reAckMs until we get a new symbol or done.
+            scheduleReAck();
+        }, reAckMs);
+    }
+
+    function tryFinalDecode() {
+        // Check that we got exactly the right number of bits.
+        // PADDED_BITS = 48 (6 symbols × 8 bits each).
+        if (rBitBuf.length !== Framing.PADDED_BITS) {
+            log('receiver-log',
+                'Bit count wrong: got ' + rBitBuf.length + ' expected ' + Framing.PADDED_BITS +
+                ' — sending NACK.', 'warn');
+            sendNackAndReset();
+            return;
+        }
+
+        // Try to find and decode the frame in the bit buffer.
+        const result = Framing.parseFrame(rBitBuf);
+        if (!result) {
+            log('receiver-log', 'Frame parse failed (SYNC/END not found or Hamming gave L>20) — sending NACK.', 'warn');
+            sendNackAndReset();
+            return;
+        }
+
+        // Success!
         setRxState('DONE');
-        log('receiver-log', `Frame decoded! L=${result.L}  msg=${result.messageBits.join('')}`, 'success');
+        log('receiver-log', 'Frame decoded! L=' + result.L + '  msg=' + result.messageBits.join(''), 'success');
 
         if (result.errorMsgBitIdx !== null) {
-            log('receiver-log', `Error corrected at message bit ${result.errorMsgBitIdx}`, 'warn');
+            log('receiver-log', 'Error corrected at message bit ' + result.errorMsgBitIdx, 'warn');
         } else if (result.errorDataIdx !== null) {
-            log('receiver-log', 'Parity-bit error corrected (message intact).', 'warn');
+            log('receiver-log', 'Parity-bit error corrected (message itself is intact).', 'warn');
         } else {
-            log('receiver-log', 'No bit errors detected.');
+            log('receiver-log', 'No errors detected.');
         }
 
         showResult(result);
 
-        // Send final ACK to confirm decode success
-        // Small delay to avoid collision with the per-symbol ACK
+        // Give a small delay so our last symbol-ACK has time to clear the air,
+        // then send the final ACK to tell the sender we are done.
         setTimeout(() => {
             AudioTX.playTone('ACK').then(() => {
                 log('receiver-log', 'Final ACK sent — transmission complete.');
             });
-        }, 1500);
+        }, 1200);
+    }
+
+    function sendNackAndReset() {
+        AudioTX.playTone('NACK').then(() => {
+            log('receiver-log', 'NACK sent. Resetting to LISTEN — waiting for retransmit…');
+            rBitBuf   = [];
+            rSymCount = 0;
+            if (RX) RX.resetClock();
+            startListening();
+        });
     }
 
     function showResult(result) {
@@ -519,45 +616,42 @@
         const metaEl = document.getElementById('rx-meta');
         area.classList.remove('hidden');
 
-        const bits = result.messageBits, errIdx = result.errorMsgBitIdx;
+        const bits   = result.messageBits;
+        const errIdx = result.errorMsgBitIdx;
+
         if (errIdx !== null && errIdx < bits.length) {
             let html = '';
             bits.forEach((b, i) => {
-                html += i === errIdx
-                    ? `<span class="err-bit" title="bit ${i} corrected">${b}</span>`
-                    : `${b}`;
+                if (i === errIdx) {
+                    html += '<span class="err-bit" title="bit ' + i + ' corrected">' + b + '</span>';
+                } else {
+                    html += b;
+                }
             });
             msgEl.innerHTML = html;
-            errEl.textContent = `Bit ${errIdx} (0-indexed) was in error and has been corrected.`;
+            errEl.textContent = 'Bit ' + errIdx + ' (0-indexed) was in error and has been corrected.';
             errEl.className   = 'rx-err-info error';
         } else {
             msgEl.textContent = bits.join('');
-            errEl.textContent  = 'No error detected.';
-            errEl.className    = 'rx-err-info ok';
+            errEl.textContent = 'No error detected.';
+            errEl.className   = 'rx-err-info ok';
         }
-        metaEl.textContent = `Length: ${bits.length} bit${bits.length !== 1 ? 's' : ''}  |  Symbols: ${rSymCount}`;
+
+        metaEl.textContent = 'Length: ' + bits.length + ' bit' + (bits.length !== 1 ? 's' : '') +
+                             '  |  Symbols received: ' + rSymCount;
     }
 
-    function sendFinalNack() {
-        setRxState('DECODING');
-        AudioTX.playTone('NACK').then(() => {
-            log('receiver-log', 'NACK sent. Resetting — waiting for retransmit…');
-            // Reset and go back to listening
-            rBitBuf = []; rSymCount = 0;
-            if (RX) RX.resetClock();
-            startListening();
-        });
-    }
+    // ── Debug panel helpers ───────────────────────────────────────────────────
 
     function updateDebugPanel(info) {
         const found = info.screenFound;
         document.getElementById('dbg-markers').textContent =
-            found ? '4/4 detected' : `searching… (${info.candidateCount || 0} candidates)`;
+            found ? '4/4 detected' : 'searching… (' + (info.candidateCount || 0) + ' candidates)';
 
         if (info.clockState !== undefined) {
-            const pending  = info.newSymbol ? ' ★ SYMBOL' : (info.cooldown > 0 ? ` [cd:${info.cooldown}]` : '');
+            const pending = info.newSymbol ? ' ★ SYMBOL' : (info.cooldown > 0 ? ' [cd:' + info.cooldown + ']' : '');
             document.getElementById('dbg-clock').textContent =
-                `${info.clockState}  luma=${info.luma}  mid=${info.midLuma}${pending}`;
+                info.clockState + '  luma=' + info.luma + '  mid=' + info.midLuma + pending;
         }
         if (info.cellColors !== undefined) {
             document.getElementById('dbg-cells').textContent = info.cellColors.join(' ');
@@ -577,7 +671,6 @@
         overlay.height = overlay.offsetHeight || video.offsetHeight;
         const ctx = _overlayCtx;
         ctx.clearRect(0, 0, overlay.width, overlay.height);
-
         if (!quad || !video.videoWidth) return;
 
         const sx = overlay.width  / video.videoWidth;
@@ -592,11 +685,9 @@
         pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
         ctx.closePath();
         ctx.fill();
-
         ctx.strokeStyle = '#22d3a5';
         ctx.lineWidth   = 2;
         ctx.stroke();
-
         pts.forEach(p => {
             ctx.beginPath();
             ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
@@ -606,8 +697,9 @@
     }
 
     function resetReceiver() {
-        clearTimeout(rListenTimer);
-        rBitBuf = []; rSymCount = 0;
+        clearTimeout(rReAckTimer);
+        rBitBuf   = [];
+        rSymCount = 0;
         setRxState('IDLE');
         document.getElementById('rx-result-area').classList.add('hidden');
         document.getElementById('receiver-log').innerHTML = '';
@@ -625,27 +717,27 @@
     }
 
     function cleanupReceiver() {
-        clearTimeout(rListenTimer);
+        clearTimeout(rReAckTimer);
         if (RX) RX.stop();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  DEBUG CONSOLE
+    //  DEBUG CONSOLE  (unchanged from original)
     // ═══════════════════════════════════════════════════════════════════════════
     let debugAudioRX = null, debugRX = null, _dbgWarpCtx = null, _dbgWarpTimer = null;
 
     function initDebugLab() {
         document.getElementById('btn-dbg-ready').onclick = () => {
             AudioTX.playTone('READY');
-            log('debug-log', 'Playing READY (1150+1450 Hz, 450 ms)');
+            log('debug-log', 'Playing READY (1150+1450 Hz)');
         };
         document.getElementById('btn-dbg-ack').onclick = () => {
             AudioTX.playTone('ACK');
-            log('debug-log', 'Playing ACK (1750+2150 Hz, 350 ms)');
+            log('debug-log', 'Playing ACK (1750+2150 Hz)');
         };
         document.getElementById('btn-dbg-nack').onclick = () => {
             AudioTX.playTone('NACK');
-            log('debug-log', 'Playing NACK (2550+2950 Hz, 450 ms)');
+            log('debug-log', 'Playing NACK (2550+2950 Hz)');
         };
 
         const btnStart = document.getElementById('btn-dbg-listen-start');
@@ -655,7 +747,7 @@
             debugAudioRX = new AudioRX();
             debugAudioRX.onTone = (name) => {
                 document.getElementById('dbg-tone-name').textContent = name;
-                log('debug-log', `Detected: ${name}`, 'success');
+                log('debug-log', 'Detected: ' + name, 'success');
             };
             debugAudioRX.onDebugPoll = (info) => {
                 const el = document.getElementById('dbg-fft-info');
@@ -663,7 +755,9 @@
                 const lines = [];
                 for (const [name, data] of Object.entries(info)) {
                     const passStr = data.pass ? 'PASS' : '----';
-                    lines.push(`${name.padEnd(6)} peaks=[${data.peaks.join(', ')}] dB  prom=[${data.prominences.join(', ')}] dB  twist=${data.twist} dB  ${passStr}`);
+                    lines.push(name.padEnd(6) + ' peaks=[' + data.peaks.join(', ') + '] dB' +
+                        '  prom=[' + data.prominences.join(', ') + '] dB' +
+                        '  twist=' + data.twist + ' dB  ' + passStr);
                 }
                 el.textContent = lines.join('\n');
             };
@@ -689,8 +783,7 @@
         const btnCamStop  = document.getElementById('btn-dbg-cam-stop');
         const btnDbgCalib = document.getElementById('btn-dbg-calib');
         _dbgWarpCtx = document.getElementById('dbg-warp-canvas').getContext('2d');
-        const dbgBinaryCtx = document.getElementById('dbg-binary-canvas').getContext('2d');
-        const dbgOverlayCtx = document.getElementById('dbg-overlay').getContext('2d');
+        const dbgBinaryCtx  = document.getElementById('dbg-binary-canvas').getContext('2d');
 
         btnCamStart.onclick = async () => {
             const video = document.getElementById('dbg-video');
@@ -702,16 +795,13 @@
                 btnCamStop.disabled  = false;
                 if (btnDbgCalib) btnDbgCalib.disabled = false;
                 log('debug-log', 'Debug camera started.');
-
                 _dbgWarpTimer = setInterval(() => {
                     if (!debugRX) return;
-                    // Render Warped View
                     const wc = debugRX.getWarpedCanvas();
                     if (wc && _dbgWarpCtx) {
                         const dc = document.getElementById('dbg-warp-canvas');
                         _dbgWarpCtx.drawImage(wc, 0, 0, dc.width, dc.height);
                     }
-                    // Render Binary Mask
                     const bc = debugRX.getBinaryCanvas();
                     if (bc && dbgBinaryCtx) {
                         const bEl = document.getElementById('dbg-binary-canvas');
@@ -727,14 +817,15 @@
             btnDbgCalib.onclick = () => {
                 if (!debugRX) return;
                 btnDbgCalib.disabled = true;
-                log('debug-log', 'Sampling 25 calibration frames in debug mode…');
+                log('debug-log', 'Sampling 25 calibration frames…');
                 debugRX.startCalibration(() => {
                     btnDbgCalib.disabled = false;
-                    log('debug-log', 'Debug calibration complete!', 'success');
-                    log('debug-log', `Clock midpoint luma: ${debugRX.clockMidLuma.toFixed(1)}`);
+                    log('debug-log', 'Debug calibration done!', 'success');
+                    log('debug-log', 'Clock midpoint luma: ' + debugRX.clockMidLuma.toFixed(1));
                     if (debugRX.refColors) {
                         debugRX.refColors.forEach((c, i) => {
-                            log('debug-log', `  Ref[${Framing.COLOR_NAMES[i]}]: R=${c.r.toFixed(0)} G=${c.g.toFixed(0)} B=${c.b.toFixed(0)}`);
+                            log('debug-log', 'Ref[' + Framing.COLOR_NAMES[i] + ']: R=' +
+                                c.r.toFixed(0) + ' G=' + c.g.toFixed(0) + ' B=' + c.b.toFixed(0));
                         });
                     }
                 });
@@ -760,7 +851,7 @@
 
     function updateDebugVision(info) {
         const el = (id) => document.getElementById(id);
-        const video = document.getElementById('dbg-video');
+        const video   = document.getElementById('dbg-video');
         const overlay = document.getElementById('dbg-overlay');
 
         if (overlay && video && video.videoWidth) {
@@ -768,62 +859,57 @@
             overlay.height = overlay.offsetHeight || video.offsetHeight;
             const ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-
             if (info.quad) {
                 const sx = overlay.width  / video.videoWidth;
                 const sy = overlay.height / video.videoHeight;
                 const pts = [info.quad.TL, info.quad.TR, info.quad.BR, info.quad.BL].map(p => ({
                     x: p.x * sx, y: p.y * sy
                 }));
-
                 ctx.fillStyle = 'rgba(34,211,165,0.12)';
                 ctx.beginPath();
                 ctx.moveTo(pts[0].x, pts[0].y);
                 pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
                 ctx.closePath();
                 ctx.fill();
-
                 ctx.strokeStyle = '#22d3a5';
                 ctx.lineWidth   = 2;
                 ctx.stroke();
-
                 pts.forEach((p, idx) => {
                     ctx.beginPath();
                     ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-                    ctx.fillStyle = idx === 0 ? '#f472b6' : '#22d3a5'; // TL in pink
+                    ctx.fillStyle = idx === 0 ? '#f472b6' : '#22d3a5';
                     ctx.fill();
                 });
             }
         }
 
         el('dbg-v-markers').textContent = info.screenFound ? 'Locked (4/4)' : 'Searching…';
-        el('dbg-v-candidates').textContent = `${info.candidateCount || 0} candidates  |  ${info.fps || 0} fps`;
+        el('dbg-v-candidates').textContent = (info.candidateCount || 0) + ' candidates  |  ' + (info.fps || 0) + ' fps';
 
         if (info.clockState !== undefined) {
-            const pending = info.newSymbol ? ' ★ SYMBOL' : (info.cooldown > 0 ? ` [cooldown:${info.cooldown}]` : '');
-            el('dbg-v-clock').textContent = `${info.clockState === 'B' ? 'BLACK' : 'WHITE'} (luma=${info.luma}, mid=${info.midLuma})${pending}`;
+            const pending = info.newSymbol ? ' ★ SYMBOL' : (info.cooldown > 0 ? ' [cooldown:' + info.cooldown + ']' : '');
+            el('dbg-v-clock').textContent =
+                (info.clockState === 'B' ? 'BLACK' : 'WHITE') +
+                ' (luma=' + info.luma + ', mid=' + info.midLuma + ')' + pending;
         }
 
         if (info.cellColors !== undefined) {
             const COLOR_BITS = ['00', '01', '10', '11'];
             const COLOR_HEX  = ['#FFFFFF', '#FF2222', '#22DD22', '#2266FF'];
             const POS_NAMES  = ['TL', 'TR', 'BL', 'BR'];
-
             let bits8 = '';
             info.cellColors.forEach((cName, i) => {
                 const cIdx = ['WHITE', 'RED', 'GREEN', 'BLUE'].indexOf(cName);
-                const idx = cIdx >= 0 ? cIdx : 0;
+                const idx  = cIdx >= 0 ? cIdx : 0;
                 const bits = COLOR_BITS[idx];
                 bits8 += (i > 0 ? ' ' : '') + bits;
-
-                const colEl = document.getElementById(`dbg-swatch-color-${i}`);
-                const lblEl = document.getElementById(`dbg-swatch-name-${i}`);
-                const bitEl = document.getElementById(`dbg-swatch-bits-${i}`);
+                const colEl = document.getElementById('dbg-swatch-color-' + i);
+                const lblEl = document.getElementById('dbg-swatch-name-' + i);
+                const bitEl = document.getElementById('dbg-swatch-bits-' + i);
                 if (colEl) colEl.style.backgroundColor = COLOR_HEX[idx];
-                if (lblEl) lblEl.textContent = `${POS_NAMES[i]}: ${cName}`;
+                if (lblEl) lblEl.textContent = POS_NAMES[i] + ': ' + cName;
                 if (bitEl) bitEl.textContent = bits;
             });
-
             const symEl = document.getElementById('dbg-v-symbol-bits');
             if (symEl) symEl.textContent = bits8;
         }
